@@ -150,18 +150,88 @@ def get_active_exe():
         return ""
 
 
+class KeyboardThread(threading.Thread):
+    """
+    Dedicated thread that owns the keyboard library's WH_KEYBOARD_LL hook.
+    All hook_key / unhook calls MUST happen on this thread so the Windows
+    message pump dispatches events to them. We run a simple queue loop here.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="KeyboardThread")
+        self._queue = []
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self.start()
+        self._ready.wait()  # block until the thread has primed the pump
+
+    def run(self):
+        # Force the keyboard library to install its hook on THIS thread
+        # by doing a no-op hook immediately.
+        _noop_hook = keyboard.hook(lambda e: None, suppress=False)
+        keyboard.unhook(_noop_hook)
+        self._ready.set()
+
+        # Service queued callables forever
+        while True:
+            with self._lock:
+                work = self._queue[:]
+                self._queue.clear()
+            for fn in work:
+                try:
+                    fn()
+                except Exception as e:
+                    print(f"KeyboardThread error: {e}")
+            time.sleep(0.005)
+
+    def call(self, fn):
+        """Queue a callable to run on the keyboard thread."""
+        with self._lock:
+            self._queue.append(fn)
+
+    def call_sync(self, fn):
+        """Queue a callable and block until it completes, returning its result."""
+        done = threading.Event()
+        result = [None]
+        exc = [None]
+
+        def wrapper():
+            try:
+                result[0] = fn()
+            except Exception as e:
+                exc[0] = e
+            finally:
+                done.set()
+
+        self.call(wrapper)
+        done.wait()
+        if exc[0]:
+            raise exc[0]
+        return result[0]
+
+
+# Single shared keyboard thread for the whole process
+_kb_thread = None
+
+
+def get_kb_thread():
+    global _kb_thread
+    if _kb_thread is None:
+        _kb_thread = KeyboardThread()
+    return _kb_thread
+
+
 class BindingEngine:
-    """Manages active key remaps using the keyboard library's low-level hook."""
+    """Manages active key remaps — all keyboard calls marshalled to KeyboardThread."""
 
     def __init__(self, config):
         self.config = config
         self.enabled = False
-        self.active_hooks = []  # list of hook callbacks registered via keyboard.hook_key
+        self.active_hooks = []
         self._lock = threading.Lock()
-        self._toggle_hook = None  # preserved separately so toggle survives refresh
 
     def _apply_bindings(self, bindings):
-        """Suppress the source key and send the target key via SendInput for each binding."""
+        """Must be called on the KeyboardThread."""
         for b in bindings:
             from_key = b.get("from", "").strip()
             to_key = b.get("to", "").strip()
@@ -170,7 +240,6 @@ class BindingEngine:
             try:
                 def make_handler(tk_):
                     def handler(event):
-                        # Mirror press and release so games see a clean keystroke
                         key_up = (event.event_type == keyboard.KEY_UP)
                         sendinput_key(tk_, key_up=key_up)
                         return False  # suppress original key
@@ -182,6 +251,7 @@ class BindingEngine:
                 print(f"Failed to remap {from_key} -> {to_key}: {e}")
 
     def _clear_hooks(self):
+        """Must be called on the KeyboardThread."""
         for h in self.active_hooks:
             try:
                 keyboard.unhook(h)
@@ -190,26 +260,23 @@ class BindingEngine:
         self.active_hooks.clear()
 
     def refresh(self):
-        """Re-evaluate which bindings should be active based on current foreground app."""
-        with self._lock:
+        """Compute the right binding set and re-install hooks on the keyboard thread."""
+        exe = get_active_exe()
+        bindings = list(self.config.get("global", []))
+        profiles = self.config.get("profiles", {})
+        for app_exe, app_bindings in profiles.items():
+            if app_exe.lower() == exe:
+                bindings.extend(app_bindings)
+                break
+
+        enabled = self.enabled
+
+        def _do():
             self._clear_hooks()
-            if not self.enabled:
-                return
+            if enabled:
+                self._apply_bindings(bindings)
 
-            exe = get_active_exe()
-            bindings = []
-
-            # Apply global bindings first
-            bindings.extend(self.config.get("global", []))
-
-            # Override/extend with per-app profile if one matches
-            profiles = self.config.get("profiles", {})
-            for app_exe, app_bindings in profiles.items():
-                if app_exe.lower() == exe:
-                    bindings.extend(app_bindings)
-                    break
-
-            self._apply_bindings(bindings)
+        get_kb_thread().call(_do)
 
     def set_enabled(self, enabled):
         self.enabled = enabled
@@ -486,8 +553,9 @@ class App(tk.Tk):
         self._enabled = tk.BooleanVar(value=False)
         self._build_ui()
 
-        # Register F10 toggle via hook_key so we hold a direct reference
-        self._toggle_hook = keyboard.hook_key(TOGGLE_KEY, self._on_toggle_key, suppress=False)
+        # Register F10 toggle on the keyboard thread so it shares the same hook
+        self._toggle_hook = None
+        get_kb_thread().call(self._install_toggle_hook)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -687,6 +755,10 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ toggle / save
 
+    def _install_toggle_hook(self):
+        """Called on the KeyboardThread to install the F10 hook there."""
+        self._toggle_hook = keyboard.hook_key(TOGGLE_KEY, self._on_toggle_key, suppress=False)
+
     def _on_toggle_key(self, event):
         """Called by keyboard hook on F10 press/release — only act on keydown."""
         if event.event_type == keyboard.KEY_DOWN:
@@ -708,12 +780,13 @@ class App(tk.Tk):
         messagebox.showinfo("Saved", "Bindings saved successfully.")
 
     def _on_close(self):
-        # Unhook only what we own
-        self.engine._clear_hooks()
-        try:
-            keyboard.unhook(self._toggle_hook)
-        except Exception:
-            pass
+        def _cleanup():
+            self.engine._clear_hooks()
+            try:
+                keyboard.unhook(self._toggle_hook)
+            except Exception:
+                pass
+        get_kb_thread().call_sync(_cleanup)
         self.destroy()
 
 
