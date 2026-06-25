@@ -51,31 +51,37 @@ class BindingEngine:
     def __init__(self, config):
         self.config = config
         self.enabled = False
-        self.active_hooks = []  # list of (from_key, hook_ref)
+        self.active_hooks = []  # list of hook callbacks registered via keyboard.hook_key
         self._lock = threading.Lock()
+        self._toggle_hook = None  # preserved separately so toggle survives refresh
 
     def _apply_bindings(self, bindings):
-        """Register keyboard suppress+send hooks for a list of {from, to} dicts."""
+        """Suppress the source key and send the target key for each binding."""
         for b in bindings:
             from_key = b.get("from", "").strip()
             to_key = b.get("to", "").strip()
             if not from_key or not to_key:
                 continue
             try:
-                hook = keyboard.remap_key(from_key, to_key)
-                self.active_hooks.append(hook)
+                # Build a closure that captures from_key / to_key correctly
+                def make_handler(fk, tk_):
+                    def handler(event):
+                        if event.event_type == keyboard.KEY_DOWN:
+                            keyboard.send(tk_)
+                        return False  # suppress original key
+                    return handler
+
+                h = keyboard.hook_key(from_key, make_handler(from_key, to_key), suppress=True)
+                self.active_hooks.append(h)
             except Exception as e:
                 print(f"Failed to remap {from_key} -> {to_key}: {e}")
 
     def _clear_hooks(self):
-        for hook in self.active_hooks:
+        for h in self.active_hooks:
             try:
-                keyboard.remove_hotkey(hook)
+                keyboard.unhook(h)
             except Exception:
                 pass
-        # keyboard.remap_key returns a hook object; unhook it
-        # The keyboard library stores remaps internally — clear all remaps
-        keyboard.unhook_all_hotkeys()
         self.active_hooks.clear()
 
     def refresh(self):
@@ -154,26 +160,29 @@ class BindingRow(tk.Frame):
         self.to_entry.bind("<FocusIn>", lambda e: self._start_capture(self.to_var, self.to_entry))
 
     def _start_capture(self, var, entry):
-        """Capture next keypress into the entry."""
+        """Capture next keydown into the entry then immediately remove the hook."""
         var.set("Press a key…")
         entry.update()
+        hook_ref = [None]
 
         def on_key(event):
+            if event.event_type != keyboard.KEY_DOWN:
+                return
             key = event.name
-            if key not in ("unknown",):
+            if key and key != "unknown":
                 var.set(key)
-            entry.unbind("<FocusIn>")
-            return False
+                try:
+                    keyboard.unhook(hook_ref[0])
+                except Exception:
+                    pass
 
-        keyboard.hook(on_key, suppress=False)
-        # Remove hook after one key
-        def wait_and_unhook():
-            time.sleep(0.5)
-            keyboard.unhook(on_key)
-        threading.Thread(target=wait_and_unhook, daemon=True).start()
+        hook_ref[0] = keyboard.hook(on_key, suppress=False)
 
     def _capture_from(self):
         self._start_capture(self.from_var, self.from_entry)
+
+    def _capture_to(self):
+        self._start_capture(self.to_var, self.to_entry)
 
     def get(self):
         return {"from": self.from_var.get().strip(), "to": self.to_var.get().strip()}
@@ -248,8 +257,8 @@ class App(tk.Tk):
         self._enabled = tk.BooleanVar(value=False)
         self._build_ui()
 
-        # Register F10 toggle globally
-        keyboard.add_hotkey(TOGGLE_KEY, self._toggle, suppress=False)
+        # Register F10 toggle via hook_key so we hold a direct reference
+        self._toggle_hook = keyboard.hook_key(TOGGLE_KEY, self._on_toggle_key, suppress=False)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -399,6 +408,11 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ toggle / save
 
+    def _on_toggle_key(self, event):
+        """Called by keyboard hook on F10 press/release — only act on keydown."""
+        if event.event_type == keyboard.KEY_DOWN:
+            self.after(0, self._toggle)  # marshal back to tkinter thread
+
     def _toggle(self):
         new_state = not self._enabled.get()
         self._enabled.set(new_state)
@@ -415,7 +429,12 @@ class App(tk.Tk):
         messagebox.showinfo("Saved", "Bindings saved successfully.")
 
     def _on_close(self):
-        keyboard.unhook_all()
+        # Unhook only what we own
+        self.engine._clear_hooks()
+        try:
+            keyboard.unhook(self._toggle_hook)
+        except Exception:
+            pass
         self.destroy()
 
 
