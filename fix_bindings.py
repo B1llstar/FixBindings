@@ -8,12 +8,116 @@ import json
 import os
 import threading
 import time
+import ctypes
+import ctypes.wintypes
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import keyboard
 import win32gui
 import win32process
 import psutil
+
+# --------------------------------------------------------------------------- #
+# Low-level SendInput helpers (games require this over keybd_event)           #
+# --------------------------------------------------------------------------- #
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+KEYEVENTF_EXTENDEDKEY = 0x0001
+
+# Virtual-key name → VK code (covers common keys; keyboard lib fills the rest)
+_VK_MAP = {
+    "backspace": 0x08, "tab": 0x09, "enter": 0x0D, "shift": 0x10,
+    "ctrl": 0x11, "alt": 0x12, "pause": 0x13, "caps lock": 0x14,
+    "esc": 0x1B, "escape": 0x1B, "space": 0x20, "spacebar": 0x20,
+    "page up": 0x21, "page down": 0x22, "end": 0x23, "home": 0x24,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "insert": 0x2D, "delete": 0x2E,
+    "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74,
+    "f6": 0x75, "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79,
+    "f11": 0x7A, "f12": 0x7B,
+    "num lock": 0x90, "scroll lock": 0x91,
+    "left shift": 0xA0, "right shift": 0xA1,
+    "left ctrl": 0xA2, "right ctrl": 0xA3,
+    "left alt": 0xA4, "right alt": 0xA5,
+    "semicolon": 0xBA, "equal": 0xBB, "comma": 0xBC, "minus": 0xBD,
+    "period": 0xBE, "slash": 0xBF, "grave": 0xC0,
+    "open bracket": 0xDB, "backslash": 0xDC, "close bracket": 0xDD,
+    "apostrophe": 0xDE,
+}
+
+# Extended keys whose scan codes need the EXTENDEDKEY flag
+_EXTENDED_VKS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                 0x2D, 0x2E, 0x5B, 0x5C, 0xA3, 0xA5}
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk",         ctypes.wintypes.WORD),
+        ("wScan",       ctypes.wintypes.WORD),
+        ("dwFlags",     ctypes.wintypes.DWORD),
+        ("time",        ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class _INPUTunion(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.wintypes.DWORD), ("_u", _INPUTunion)]
+
+
+def _vk_for(key_name: str) -> int:
+    """Resolve a key name string to a Windows virtual-key code."""
+    name = key_name.lower().strip()
+    if name in _VK_MAP:
+        return _VK_MAP[name]
+    # Single printable character
+    if len(name) == 1:
+        vk = user32.VkKeyScanW(ord(name)) & 0xFF
+        if vk:
+            return vk
+    # Fall back to keyboard library's scan-code lookup
+    try:
+        sc = keyboard.key_to_scan_codes(name)[0]
+        # MapVirtualKey: scan→VK
+        vk = user32.MapVirtualKeyW(sc, 1)
+        if vk:
+            return vk
+    except Exception:
+        pass
+    return 0
+
+
+def _scan_for_vk(vk: int) -> int:
+    return user32.MapVirtualKeyW(vk, 0)
+
+
+def sendinput_key(key_name: str, key_up: bool = False):
+    """Send a key event via SendInput — works in DirectInput/raw-input games."""
+    vk = _vk_for(key_name)
+    if not vk:
+        return
+    sc = _scan_for_vk(vk)
+    flags = KEYEVENTF_SCANCODE
+    if key_up:
+        flags |= KEYEVENTF_KEYUP
+    if vk in _EXTENDED_VKS:
+        flags |= KEYEVENTF_EXTENDEDKEY
+
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp._u.ki.wVk = 0           # must be 0 when using scan code
+    inp._u.ki.wScan = sc
+    inp._u.ki.dwFlags = flags
+    inp._u.ki.time = 0
+    inp._u.ki.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
+    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 # Always store bindings next to the script, regardless of working directory
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bindings.json")
@@ -57,22 +161,22 @@ class BindingEngine:
         self._toggle_hook = None  # preserved separately so toggle survives refresh
 
     def _apply_bindings(self, bindings):
-        """Suppress the source key and send the target key for each binding."""
+        """Suppress the source key and send the target key via SendInput for each binding."""
         for b in bindings:
             from_key = b.get("from", "").strip()
             to_key = b.get("to", "").strip()
             if not from_key or not to_key:
                 continue
             try:
-                # Build a closure that captures from_key / to_key correctly
-                def make_handler(fk, tk_):
+                def make_handler(tk_):
                     def handler(event):
-                        if event.event_type == keyboard.KEY_DOWN:
-                            keyboard.send(tk_)
+                        # Mirror press and release so games see a clean keystroke
+                        key_up = (event.event_type == keyboard.KEY_UP)
+                        sendinput_key(tk_, key_up=key_up)
                         return False  # suppress original key
                     return handler
 
-                h = keyboard.hook_key(from_key, make_handler(from_key, to_key), suppress=True)
+                h = keyboard.hook_key(from_key, make_handler(to_key), suppress=True)
                 self.active_hooks.append(h)
             except Exception as e:
                 print(f"Failed to remap {from_key} -> {to_key}: {e}")
