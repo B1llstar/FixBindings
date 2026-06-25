@@ -167,7 +167,7 @@ class HookEngine:
     """
 
     def __init__(self):
-        self._bindings: dict[int, int] = {}   # vk_from -> vk_to
+        self._bindings = {}   # vk_from -> vk_to
         self._toggle_vk: int = vk_for("f10")
         self._enabled = False
         self._on_toggle_cb = None             # callable to invoke on F10
@@ -224,7 +224,7 @@ class HookEngine:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     # ------------------------------------------------------------------
-    def set_bindings(self, bindings: dict[int, int]):
+    def set_bindings(self, bindings):
         self._bindings = bindings
 
     def set_enabled(self, enabled: bool):
@@ -282,9 +282,9 @@ class BindingManager:
         self._config = config
         self._enabled = False
 
-    def _resolve(self) -> dict[int, int]:
+    def _resolve(self):
         exe = get_active_exe()
-        bindings: list[dict] = list(self._config.get("global", []))
+        bindings = list(self._config.get("global", []))
         for app_exe, app_bindings in self._config.get("profiles", {}).items():
             if app_exe.lower() == exe:
                 bindings.extend(app_bindings)
