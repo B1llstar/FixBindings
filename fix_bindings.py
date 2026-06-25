@@ -242,6 +242,48 @@ class ProfilePanel(tk.Frame):
         return result
 
 
+class CopyFromDialog(tk.Toplevel):
+    """Pick a source profile and whether to append or replace."""
+
+    def __init__(self, parent, sources):
+        super().__init__(parent)
+        self.title("Copy Bindings From")
+        self.resizable(False, False)
+        self.geometry("300x280")
+        self.grab_set()
+        self.result = None  # (source_name, mode)  mode = "append" | "replace"
+
+        tk.Label(self, text="Copy from:", anchor="w").pack(fill="x", padx=12, pady=(12, 4))
+
+        self._var = tk.StringVar(value=sources[0])
+        for src in sources:
+            tk.Radiobutton(self, text=src, variable=self._var, value=src,
+                           anchor="w").pack(fill="x", padx=24)
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=8)
+
+        tk.Label(self, text="How to apply:", anchor="w").pack(fill="x", padx=12)
+        self._mode = tk.StringVar(value="append")
+        tk.Radiobutton(self, text="Append  (keep existing + add new)",
+                       variable=self._mode, value="append", anchor="w").pack(fill="x", padx=24)
+        tk.Radiobutton(self, text="Replace  (overwrite current bindings)",
+                       variable=self._mode, value="replace", anchor="w").pack(fill="x", padx=24)
+
+        btn_row = tk.Frame(self)
+        btn_row.pack(fill="x", padx=12, pady=10)
+        tk.Button(btn_row, text="Copy", command=self._confirm).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        tk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="left", expand=True, fill="x")
+
+        self.bind("<Return>", self._confirm)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.transient(parent)
+        self.wait_window(self)
+
+    def _confirm(self, event=None):
+        self.result = (self._var.get(), self._mode.get())
+        self.destroy()
+
+
 def get_running_exes():
     """Return sorted list of unique exe names for all running processes."""
     seen = set()
@@ -387,6 +429,10 @@ class App(tk.Tk):
         tk.Button(btn_row, text="+ App", command=self._add_profile).pack(side="left", expand=True, fill="x")
         tk.Button(btn_row, text="✕ Del", fg="red", command=self._delete_profile).pack(side="left", expand=True, fill="x")
 
+        btn_row2 = tk.Frame(left)
+        btn_row2.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Button(btn_row2, text="Copy From…", command=self._copy_from_profile).pack(fill="x", expand=True)
+
         # Right: binding editor
         right = tk.Frame(paned)
         paned.add(right, minsize=320)
@@ -486,6 +532,54 @@ class App(tk.Tk):
             self.active_panel = None
             self.profile_title.config(text="Select a profile")
         self._populate_profile_list()
+
+    def _copy_from_profile(self):
+        if not self.active_panel:
+            messagebox.showinfo("No profile selected", "Select a destination profile first.")
+            return
+
+        dest_name = getattr(self.active_panel, "_profile_name", None)
+        if dest_name is None:
+            return
+
+        # Build list of all profiles except the current destination
+        all_profiles = ["Global"] + list(self.config_data.get("profiles", {}).keys())
+        sources = [p for p in all_profiles if p != dest_name]
+        if not sources:
+            messagebox.showinfo("Nothing to copy from", "No other profiles exist yet.")
+            return
+
+        dialog = CopyFromDialog(self, sources)
+        if not dialog.result:
+            return
+
+        src_name, mode = dialog.result
+
+        # Get source bindings
+        if src_name == "Global":
+            src_bindings = list(self.config_data.get("global", []))
+        else:
+            src_bindings = list(self.config_data.get("profiles", {}).get(src_name, []))
+
+        if not src_bindings:
+            messagebox.showinfo("Empty", f"'{src_name}' has no bindings to copy.")
+            return
+
+        if mode == "replace":
+            # Wipe existing rows and load source bindings fresh
+            for row in list(self.active_panel.rows):
+                row.destroy()
+            self.active_panel.rows.clear()
+            for b in src_bindings:
+                self.active_panel.add_row(b.get("from", ""), b.get("to", ""))
+        else:
+            # Append — skip exact duplicates
+            existing = {(r.from_var.get(), r.to_var.get()) for r in self.active_panel.rows}
+            for b in src_bindings:
+                pair = (b.get("from", ""), b.get("to", ""))
+                if pair not in existing:
+                    self.active_panel.add_row(*pair)
+                    existing.add(pair)
 
     # ------------------------------------------------------------------ toggle / save
 
