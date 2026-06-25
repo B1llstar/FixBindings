@@ -15,7 +15,8 @@ import win32gui
 import win32process
 import psutil
 
-CONFIG_FILE = "bindings.json"
+# Always store bindings next to the script, regardless of working directory
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bindings.json")
 TOGGLE_KEY = "F10"
 
 
@@ -241,6 +242,88 @@ class ProfilePanel(tk.Frame):
         return result
 
 
+def get_running_exes():
+    """Return sorted list of unique exe names for all running processes."""
+    seen = set()
+    result = []
+    for proc in psutil.process_iter(["name"]):
+        try:
+            name = proc.info["name"]
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                result.append(name.lower())
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return sorted(result)
+
+
+class AppPickerDialog(tk.Toplevel):
+    """Modal dialog: pick from running processes or type a name manually."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Add App Profile")
+        self.resizable(False, True)
+        self.geometry("360x460")
+        self.grab_set()
+        self.result = None
+
+        tk.Label(self, text="Search or type an .exe name:", anchor="w").pack(fill="x", padx=10, pady=(10, 2))
+
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", self._on_search)
+        search_entry = tk.Entry(self, textvariable=self._search_var)
+        search_entry.pack(fill="x", padx=10)
+        search_entry.focus_set()
+
+        tk.Label(self, text="Running processes:", anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+
+        frame = tk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10)
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical")
+        self._listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, exportselection=False)
+        scrollbar.config(command=self._listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._listbox.pack(side="left", fill="both", expand=True)
+        self._listbox.bind("<Double-Button-1>", self._on_select)
+        self._listbox.bind("<<ListboxSelect>>", self._on_listbox_pick)
+
+        self._all_exes = get_running_exes()
+        self._populate(self._all_exes)
+
+        btn_row = tk.Frame(self)
+        btn_row.pack(fill="x", padx=10, pady=8)
+        tk.Button(btn_row, text="Add Selected / Typed", command=self._on_select).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        tk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="left", expand=True, fill="x")
+
+        self.bind("<Return>", self._on_select)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.transient(parent)
+        self.wait_window(self)
+
+    def _populate(self, exes):
+        self._listbox.delete(0, "end")
+        for exe in exes:
+            self._listbox.insert("end", exe)
+
+    def _on_search(self, *_):
+        q = self._search_var.get().lower()
+        filtered = [e for e in self._all_exes if q in e] if q else self._all_exes
+        self._populate(filtered)
+
+    def _on_listbox_pick(self, event=None):
+        sel = self._listbox.curselection()
+        if sel:
+            self._search_var.set(self._listbox.get(sel[0]))
+
+    def _on_select(self, event=None):
+        name = self._search_var.get().strip()
+        if name:
+            self.result = name
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -367,9 +450,7 @@ class App(tk.Tk):
             self.config_data["profiles"][name] = bindings
 
     def _add_profile(self):
-        name = simpledialog.askstring("New App Profile",
-                                      "Enter the .exe name (e.g. game.exe):",
-                                      parent=self)
+        name = AppPickerDialog(self).result
         if not name:
             return
         name = name.strip().lower()
